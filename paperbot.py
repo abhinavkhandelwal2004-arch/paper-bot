@@ -14,7 +14,7 @@ warnings.filterwarnings('ignore')
 # ============================================================
 # ==================== CONFIGURATION =========================
 # ============================================================
-TOKEN = "8919842664:AAGkhQOFPJMmxrJR9InuPRS9wCX7JqXYRc4"
+TOKEN = "8919842664:AAEcxSad6guNmcqPwlBFn_BBtwAAvrB8Ac8"
 CHAT_ID = "5606330617"
 
 CAPITAL_START = 5000.0
