@@ -1,10 +1,6 @@
 """
-AI Paper Trading Bot v7.1 — DELIVERY MODE (Bug Fixes Applied)
-- Capital: ₹5,000 (available cash model)
-- 20 Strategies with scoring system
-- NSE + BSE universe
-- Multi-day position holding
-- Full English Telegram alerts
+AI Paper Trading Bot v7.3 — QUICK PROFIT DELIVERY MODE
+Bug Fixes: double manage, daily reset, momentum save, multi-entry, entry_dt fallback
 """
 
 import yfinance as yf
@@ -21,17 +17,24 @@ warnings.filterwarnings('ignore')
 TOKEN = "8919842664:AAETGXag3sLOBTHICEOOFRe2j1ug3mXcb_0"
 CHAT_ID = "5606330617"
 
-# ---- CAPITAL ----
 CAPITAL_START = 5000.0
 CAPITAL_MODE = "DELIVERY"
-RISK_PER_TRADE_PCT = 0.015         # 1.5% = ₹75 per trade
-DAILY_LOSS_LIMIT_PCT = 0.03        # 3% = ₹150
-MAX_DRAWDOWN_PCT = 0.12            # 12% halt
+RISK_PER_TRADE_PCT = 0.015
+DAILY_LOSS_LIMIT_PCT = 0.03
+MAX_DRAWDOWN_PCT = 0.12
 MAX_POSITIONS = 3
-MAX_TRADES_PER_DAY = 3
+MAX_TRADES_PER_DAY = 4
 MIN_SIGNAL_SCORE = 5
 
-# ---- DELIVERY CHARGES (Zerodha 2026) ----
+TARGET_1_R_MULTIPLE = 1.0
+TARGET_2_R_MULTIPLE = 2.0
+PARTIAL_BOOK_PCT = 0.6
+TRAIL_PCT_AFTER_1R = 0.008
+TRAIL_PCT_BEFORE_1R = 0.012
+HOLD_DAYS_MAX = 3
+NO_MOVE_EXIT_HOURS = 36
+MOMENTUM_BOOST_R = 1.5
+
 STT_DELIVERY_PCT = 0.001
 EXCHANGE_TXN_PCT = 0.0000322
 SEBI_FEE_PCT = 0.000001
@@ -39,15 +42,7 @@ STAMP_DUTY_BUY = 0.00015
 DP_CHARGES = 13.5
 GST_PCT = 0.18
 
-# ---- RISK/REWARD ----
 MIN_PROFIT_MULTIPLIER = 3
-TARGET_1_R_MULTIPLE = 1.5
-TARGET_2_R_MULTIPLE = 3.0
-PARTIAL_BOOK_PCT = 0.5
-TRAIL_PCT_AFTER_1R = 0.015
-HOLD_DAYS_MAX = 10
-
-# ---- STRATEGY SETTINGS ----
 AUTO_DISABLE_AFTER_LOSSES = 3
 STRATEGY_MIN_WINRATE = 0.35
 
@@ -92,25 +87,19 @@ BSE_STOCKS = [
 ]
 
 def build_universe():
-    seen = set()
-    combined = []
+    seen = set(); combined = []
     for s in NSE_STOCKS:
         base = s.replace(".NS", "")
         if base not in seen:
-            seen.add(base)
-            combined.append(s)
+            seen.add(base); combined.append(s)
     for s in BSE_STOCKS:
         base = s.replace(".BO", "")
         if base not in seen:
-            seen.add(base)
-            combined.append(s)
+            seen.add(base); combined.append(s)
     return combined
 
 WATCHLIST = build_universe()
 
-# ============================================================
-# ==================== STRATEGY NAMES ========================
-# ============================================================
 STRATEGY_NAMES = [
     "ORB", "VWAP_PULLBACK", "EMA_CROSS", "SUPERTREND_ADX", "BB_SQUEEZE",
     "RSI_DIVERGENCE", "CPR", "MACD_RSI", "INSIDE_BAR", "STOCHRSI_ST",
@@ -133,9 +122,9 @@ def send_telegram(msg):
                          params={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"},
                          timeout=10)
         if r.status_code != 200:
-            print(f"[Telegram Error] {r.status_code}: {r.text[:200]}")
+            print(f"[TG Error] {r.status_code}: {r.text[:200]}")
     except Exception as e:
-        print(f"[Telegram Exception] {e}")
+        print(f"[TG Exception] {e}")
 
 def send_document(filepath, caption=""):
     try:
@@ -148,25 +137,23 @@ def send_document(filepath, caption=""):
         print(f"[Doc Error] {e}")
 
 def calc_charges(buy_price, sell_price, qty):
-    """Delivery charges (Zerodha CNC)"""
     buy_val = buy_price * qty
     sell_val = sell_price * qty
     turnover = buy_val + sell_val
-    brokerage = 0.0
     stt = STT_DELIVERY_PCT * (buy_val + sell_val)
     exch = EXCHANGE_TXN_PCT * turnover
     sebi = SEBI_FEE_PCT * turnover
     stamp = STAMP_DUTY_BUY * buy_val
     dp = DP_CHARGES
-    gst = GST_PCT * (brokerage + exch + sebi)
-    return round(brokerage + stt + exch + sebi + stamp + dp + gst, 2)
+    gst = GST_PCT * (exch + sebi)
+    return round(stt + exch + sebi + stamp + dp + gst, 2)
 
 def min_required_net_profit():
-    est = calc_charges(500, 520, 5)
-    return max(15.0, est * MIN_PROFIT_MULTIPLIER)
+    est = calc_charges(500, 505, 5)
+    return max(12.0, est * MIN_PROFIT_MULTIPLIER)
 
 # ============================================================
-# ==================== STATE (FIXED) =========================
+# ==================== STATE =================================
 # ============================================================
 def load_state():
     default = {
@@ -178,31 +165,25 @@ def load_state():
         "loss_today": 0.0,
         "open_positions": [],
         "disabled_today": [],
-        "last_daily": "",
-        "last_weekly": "",
-        "last_monthly": "",
+        "last_daily": "", "last_weekly": "", "last_monthly": "",
         "drawdown_alerted": ""
     }
     if os.path.exists(CAPITAL_FILE):
         try:
             with open(CAPITAL_FILE) as f:
                 state = json.load(f)
-            # Merge missing keys from default
             for k, v in default.items():
-                if k not in state:
-                    state[k] = v
-            # Safety: ensure open_positions is list
+                state.setdefault(k, v)
             if not isinstance(state.get("open_positions"), list):
                 state["open_positions"] = []
             return state
         except Exception as e:
-            print(f"[State Load Error] {e}. Using default.")
-            return default
-    return default
+            print(f"[State Load Error] {e}")
+            return default.copy()
+    return default.copy()
 
 def save_state(s):
     try:
-        # Ensure serializable
         s["open_positions"] = list(s.get("open_positions", []))
         s["disabled_today"] = list(s.get("disabled_today", []))
         with open(CAPITAL_FILE, "w") as f:
@@ -210,25 +191,32 @@ def save_state(s):
     except Exception as e:
         print(f"[State Save Error] {e}")
 
+def daily_reset_if_needed(state):
+    """FIX: Separate function - called first in main loop"""
+    today = str(datetime.now(IST).date())
+    if state["date"] != today:
+        state["date"] = today
+        state["trades_today"] = 0
+        state["loss_today"] = 0.0
+        state["disabled_today"] = []
+        state["drawdown_alerted"] = ""
+        save_state(state)
+        return True, today
+    return False, today
+
 def load_strategy_stats():
-    """Load and merge — ensures all current STRATEGY_NAMES exist"""
     stats = {}
     if os.path.exists(STRATEGY_STATS_FILE):
         try:
             with open(STRATEGY_STATS_FILE) as f:
                 stats = json.load(f)
-        except Exception as e:
-            print(f"[Stats Load Error] {e}")
-            stats = {}
-    # Ensure all current strategies present
+        except: stats = {}
     for s in STRATEGY_NAMES:
         if s not in stats or not isinstance(stats.get(s), dict):
-            stats[s] = {"wins": 0, "losses": 0, "pnl": 0.0, "streak_losses": 0, "total": 0}
+            stats[s] = {"wins":0,"losses":0,"pnl":0.0,"streak_losses":0,"total":0}
         else:
-            stats[s].setdefault("wins", 0)
-            stats[s].setdefault("losses", 0)
-            stats[s].setdefault("pnl", 0.0)
-            stats[s].setdefault("streak_losses", 0)
+            stats[s].setdefault("wins", 0); stats[s].setdefault("losses", 0)
+            stats[s].setdefault("pnl", 0.0); stats[s].setdefault("streak_losses", 0)
             stats[s].setdefault("total", 0)
     return stats
 
@@ -237,7 +225,7 @@ def save_strategy_stats(stats):
         with open(STRATEGY_STATS_FILE, "w") as f:
             json.dump(stats, f, indent=2)
     except Exception as e:
-        print(f"[Stats Save Error] {e}")
+        print(f"[Stats Save] {e}")
 
 def log_trade(row):
     try:
@@ -248,6 +236,20 @@ def log_trade(row):
             df.to_csv(LOG_FILE, index=False)
     except Exception as e:
         print(f"[Log Error] {e}")
+
+def safe_parse_dt(s):
+    """FIX: Safe datetime parsing with fallback"""
+    if not s: return None
+    try:
+        return datetime.fromisoformat(s)
+    except:
+        try:
+            return datetime.strptime(s, "%Y-%m-%d %H:%M:%S.%f%z")
+        except:
+            try:
+                return datetime.strptime(s, "%Y-%m-%d %H:%M:%S.%f")
+            except:
+                return None
 
 # ============================================================
 # ==================== DATA ==================================
@@ -265,9 +267,7 @@ def fetch_daily(symbol):
         df = _flatten(df)
         if df is None or len(df) < 50: return None
         return df
-    except Exception as e:
-        print(f"[fetch_daily {symbol}] {e}")
-        return None
+    except: return None
 
 def fetch_intraday(symbol):
     try:
@@ -276,8 +276,7 @@ def fetch_intraday(symbol):
         df = _flatten(df)
         if df is None or len(df) < 5: return None
         return df
-    except:
-        return None
+    except: return None
 
 def add_indicators(df):
     df["EMA9"] = df["Close"].ewm(span=9).mean()
@@ -289,13 +288,11 @@ def add_indicators(df):
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = -delta.clip(upper=0).rolling(14).mean()
     rs = gain / loss.replace(0, np.nan)
-    df["RSI"] = 100 - (100 / (1 + rs))
-    df["RSI"] = df["RSI"].fillna(50)
+    df["RSI"] = (100 - (100 / (1 + rs))).fillna(50)
 
     df["TR"] = df[["High","Low","Close"]].apply(
         lambda x: max(x["High"]-x["Low"], abs(x["High"]-x["Close"]), abs(x["Low"]-x["Close"])), axis=1)
-    df["ATR"] = df["TR"].rolling(14).mean()
-    df["ATR"] = df["ATR"].fillna(df["TR"].rolling(5).mean()).fillna(0)
+    df["ATR"] = df["TR"].rolling(14).mean().fillna(df["TR"].rolling(5).mean()).fillna(0)
 
     plus_dm = df["High"].diff().clip(lower=0)
     minus_dm = (-df["Low"].diff()).clip(lower=0)
@@ -308,8 +305,7 @@ def add_indicators(df):
     df["MINUS_DI"] = minus_di.fillna(0)
 
     tp = (df["High"] + df["Low"] + df["Close"]) / 3
-    df["VWAP"] = (tp * df["Volume"]).cumsum() / df["Volume"].cumsum().replace(0, np.nan)
-    df["VWAP"] = df["VWAP"].fillna(df["Close"])
+    df["VWAP"] = ((tp * df["Volume"]).cumsum() / df["Volume"].cumsum().replace(0, np.nan)).fillna(df["Close"])
 
     df["MA20"] = df["Close"].rolling(20).mean()
     df["STD20"] = df["Close"].rolling(20).std().fillna(0)
@@ -344,7 +340,6 @@ def add_indicators(df):
     df["HA_Close"] = (df["Open"] + df["High"] + df["Low"] + df["Close"]) / 4
     df["HA_Open"] = (df["Open"].shift(1) + df["Close"].shift(1)) / 2
     df["HA_Bull"] = df["HA_Close"] > df["HA_Open"]
-
     return df
 
 # ============================================================
@@ -434,8 +429,7 @@ def strat_cpr(df, now_time):
     last = df.iloc[-1]
     price = float(last["Close"]); atr = float(last["ATR"])
     if atr <= 0: return None
-    width = abs(tc - bc)
-    if width > 0.002 * price: return None
+    if abs(tc - bc) > 0.002 * price: return None
     if price > max(tc, bc) and float(last["Close"]) > float(last["Open"]):
         return {"side":"BUY","price":price,"sl":min(pivot, price-atr*2),"score":5}
     if price < min(tc, bc) and float(last["Close"]) < float(last["Open"]):
@@ -449,10 +443,8 @@ def strat_macd_rsi(df, now_time):
     if atr <= 0: return None
     up = float(prev["MACD"]) <= float(prev["MACD_Signal"]) and float(last["MACD"]) > float(last["MACD_Signal"])
     dn = float(prev["MACD"]) >= float(prev["MACD_Signal"]) and float(last["MACD"]) < float(last["MACD_Signal"])
-    if up and 50 < rsi < 72:
-        return {"side":"BUY","price":price,"sl":price - atr*2,"score":4}
-    if dn and 28 < rsi < 50:
-        return {"side":"SELL","price":price,"sl":price + atr*2,"score":4}
+    if up and 50 < rsi < 72: return {"side":"BUY","price":price,"sl":price - atr*2,"score":4}
+    if dn and 28 < rsi < 50: return {"side":"SELL","price":price,"sl":price + atr*2,"score":4}
     return None
 
 def strat_inside_bar(df, now_time):
@@ -472,11 +464,9 @@ def strat_stochrsi_st(df, now_time):
     last, prev = df.iloc[-1], df.iloc[-2]
     price = float(last["Close"]); k, d = float(last["K"]), float(last["D"])
     pk, pd_ = float(prev["K"]), float(prev["D"])
-    k_up = pk <= pd_ and k > d; k_dn = pk >= pd_ and k < d
-    st_up = price > float(last["ST_Lower"]); st_dn = price < float(last["ST_Upper"])
-    if k_up and k < 25 and st_up:
+    if pk <= pd_ and k > d and k < 25 and price > float(last["ST_Lower"]):
         return {"side":"BUY","price":price,"sl":float(last["ST_Lower"]),"score":5}
-    if k_dn and k > 75 and st_dn:
+    if pk >= pd_ and k < d and k > 75 and price < float(last["ST_Upper"]):
         return {"side":"SELL","price":price,"sl":float(last["ST_Upper"]),"score":5}
     return None
 
@@ -486,19 +476,16 @@ def strat_momentum_breakout(df, now_time):
     price = float(last["Close"])
     high_52 = float(df["High"].iloc[-52:-1].max())
     low_52 = float(df["Low"].iloc[-52:-1].min())
-    vol_ratio = float(last["Vol_Ratio"])
-    if price > high_52 and vol_ratio > 1.5:
-        return {"side":"BUY","price":price,"sl":high_52 * 0.98,"score":7}
-    if price < low_52 and vol_ratio > 1.5:
-        return {"side":"SELL","price":price,"sl":low_52 * 1.02,"score":7}
+    vr = float(last["Vol_Ratio"])
+    if price > high_52 and vr > 1.5: return {"side":"BUY","price":price,"sl":high_52*0.98,"score":7}
+    if price < low_52 and vr > 1.5: return {"side":"SELL","price":price,"sl":low_52*1.02,"score":7}
     return None
 
 def strat_volume_spike(df, now_time):
     if len(df) < 25: return None
     last, prev = df.iloc[-1], df.iloc[-2]
-    price = float(last["Close"])
-    vol_ratio = float(last["Vol_Ratio"])
-    if vol_ratio < 2.0: return None
+    price = float(last["Close"]); vr = float(last["Vol_Ratio"])
+    if vr < 2.0: return None
     atr = float(last["ATR"])
     if atr <= 0: return None
     if price > float(prev["High"]) and float(last["Close"]) > float(last["Open"]):
@@ -508,8 +495,7 @@ def strat_volume_spike(df, now_time):
     return None
 
 def strat_keltner_breakout(df, now_time):
-    last = df.iloc[-1]
-    price = float(last["Close"])
+    last = df.iloc[-1]; price = float(last["Close"])
     if price > float(last["KC_Upper"]) and float(last["EMA9"]) > float(last["EMA21"]):
         return {"side":"BUY","price":price,"sl":float(last["EMA21"]),"score":5}
     if price < float(last["KC_Lower"]) and float(last["EMA9"]) < float(last["EMA21"]):
@@ -517,8 +503,7 @@ def strat_keltner_breakout(df, now_time):
     return None
 
 def strat_donchian_breakout(df, now_time):
-    last = df.iloc[-1]
-    price = float(last["Close"])
+    last = df.iloc[-1]; price = float(last["Close"])
     if price >= float(last["DC_Upper"]) * 0.999 and float(last["EMA9"]) > float(last["EMA21"]):
         return {"side":"BUY","price":price,"sl":float(last["DC_Lower"]),"score":6}
     if price <= float(last["DC_Lower"]) * 1.001 and float(last["EMA9"]) < float(last["EMA21"]):
@@ -526,9 +511,7 @@ def strat_donchian_breakout(df, now_time):
     return None
 
 def strat_psar_trend(df, now_time):
-    if len(df) < 2: return None
-    last = df.iloc[-1]
-    price = float(last["Close"]); atr = float(last["ATR"])
+    last = df.iloc[-1]; price = float(last["Close"]); atr = float(last["ATR"])
     if atr <= 0: return None
     if price > float(last["PSAR"]) and float(last["EMA9"]) > float(last["EMA21"]) and float(last["ADX"]) > 20:
         return {"side":"BUY","price":price,"sl":price - atr*2,"score":4}
@@ -617,10 +600,8 @@ def get_combined_signal(df, now_time, disabled, stats):
     for strat_name in STRATEGY_NAMES:
         if strat_name in disabled: continue
         s = stats.get(strat_name, {})
-        if s.get("streak_losses", 0) >= AUTO_DISABLE_AFTER_LOSSES:
-            continue
-        if s.get("total", 0) >= 20 and s.get("wins", 0) / max(1, s.get("total", 1)) < STRATEGY_MIN_WINRATE:
-            continue
+        if s.get("streak_losses", 0) >= AUTO_DISABLE_AFTER_LOSSES: continue
+        if s.get("total", 0) >= 20 and s.get("wins", 0)/max(1, s.get("total", 1)) < STRATEGY_MIN_WINRATE: continue
         try:
             sig = STRATEGY_MAP[strat_name](df, now_time)
             if sig and sig.get("price", 0) > 0:
@@ -637,14 +618,12 @@ def get_combined_signal(df, now_time, disabled, stats):
 
     if buy_score >= MIN_SIGNAL_SCORE and buy_score > sell_score:
         sl = max(s["sl"] for s in signals["BUY"])
-        return {"side": "BUY", "price": signals["BUY"][0]["price"],
-                "sl": sl, "score": buy_score,
-                "strategies": [s["name"] for s in signals["BUY"]]}
+        return {"side":"BUY","price":signals["BUY"][0]["price"],"sl":sl,
+                "score":buy_score,"strategies":[s["name"] for s in signals["BUY"]]}
     if sell_score >= MIN_SIGNAL_SCORE and sell_score > buy_score:
         sl = min(s["sl"] for s in signals["SELL"])
-        return {"side": "SELL", "price": signals["SELL"][0]["price"],
-                "sl": sl, "score": sell_score,
-                "strategies": [s["name"] for s in signals["SELL"]]}
+        return {"side":"SELL","price":signals["SELL"][0]["price"],"sl":sl,
+                "score":sell_score,"strategies":[s["name"] for s in signals["SELL"]]}
     return None
 
 # ============================================================
@@ -656,84 +635,41 @@ def calc_position_size(available_capital, price, sl, atr):
     risk_amount = available_capital * RISK_PER_TRADE_PCT
     if atr > 0:
         atr_pct = atr / price
-        if atr_pct > 0.03:
-            risk_amount *= 0.5
-        elif atr_pct > 0.02:
-            risk_amount *= 0.75
+        if atr_pct > 0.03: risk_amount *= 0.5
+        elif atr_pct > 0.02: risk_amount *= 0.75
     qty = int(risk_amount / risk_per_share)
     max_cost = available_capital * 0.25
-    if qty * price > max_cost:
-        qty = int(max_cost // price)
-    if qty * price > available_capital:
-        qty = int(available_capital // price)
+    if qty * price > max_cost: qty = int(max_cost // price)
+    if qty * price > available_capital: qty = int(available_capital // price)
     return max(0, qty)
 
-def count_open_positions(state):
-    return len(state.get("open_positions", []))
+def count_open_positions(state): return len(state.get("open_positions", []))
 
 # ============================================================
-# ==================== SCAN & EXECUTION ======================
+# ==================== SCAN (FIXED - no manage, multi-entry)
 # ============================================================
-def run_scan():
-    state = load_state()
-    stats = load_strategy_stats()
+def run_scan(state, stats):
+    """FIX: Takes state and stats as params, no manage call, multi-entry"""
     now = datetime.now(IST)
     today = str(now.date())
 
-    # Daily reset
-    if state["date"] != today:
-        state["date"] = today
-        state["trades_today"] = 0
-        state["loss_today"] = 0.0
-        state["disabled_today"] = []
-        save_state(state)
-        send_telegram(
-            f"☀️ *New Trading Day*\n"
-            f"Available: ₹{state['capital']:.2f}\n"
-            f"Open Positions: {count_open_positions(state)}\n"
-            f"Mode: Delivery"
-        )
+    if state["loss_today"] >= DAILY_LOSS_LIMIT_PCT * state["starting_capital"]: return
+    if state["trades_today"] >= MAX_TRADES_PER_DAY: return
 
-    # Peak / drawdown
-    if state["capital"] > state["peak_capital"]:
-        state["peak_capital"] = state["capital"]
-        save_state(state)
-    drawdown = (state["peak_capital"] - state["capital"]) / max(1, state["peak_capital"])
-    if drawdown >= MAX_DRAWDOWN_PCT:
-        if state.get("drawdown_alerted") != today:
-            send_telegram(f"🛑 *TRADING HALTED*\nDrawdown: {drawdown*100:.1f}%\nResets next day.")
-            state["drawdown_alerted"] = today
-            save_state(state)
-        return
-
-    if state["loss_today"] >= DAILY_LOSS_LIMIT_PCT * state["starting_capital"]:
-        return
-    if state["trades_today"] >= MAX_TRADES_PER_DAY:
-        return
-
-    # Manage existing positions
-    for pos in list(state.get("open_positions", [])):
-        manage_open_position(state, stats, pos)
-
-    if count_open_positions(state) >= MAX_POSITIONS:
-        return
-
-    available = state["capital"]
-    if available <= 500:
-        return
+    # FIX: Fill up to MAX_POSITIONS slots
+    slots = MAX_POSITIONS - count_open_positions(state)
+    if slots <= 0: return
 
     now_time = now.time()
-    if not (dtime(14, 45) <= now_time <= dtime(15, 15)):
-        return
-
     candidates = []
+    seen_syms = set()
+
     for sym in WATCHLIST:
-        if any(p["symbol"] == sym for p in state.get("open_positions", [])):
-            continue
+        if any(p["symbol"] == sym for p in state.get("open_positions", [])): continue
+        if sym in seen_syms: continue
         df = fetch_daily(sym)
         if df is None: continue
-        try:
-            df = add_indicators(df)
+        try: df = add_indicators(df)
         except: continue
         sig = get_combined_signal(df, now_time, state["disabled_today"], stats)
         if not sig: continue
@@ -742,77 +678,83 @@ def run_scan():
         atr = float(last["ATR"])
         price = sig["price"]; sl = sig["sl"]
         if atr <= 0: continue
-
         if sig["side"] == "BUY" and sl >= price: continue
         if sig["side"] == "SELL" and sl <= price: continue
 
-        qty = calc_position_size(available, price, sl, atr)
+        qty = calc_position_size(state["capital"], price, sl, atr)
         if qty < 1: continue
         cost = price * qty
-        if cost > available: continue
+        if cost > state["capital"]: continue
 
-        risk_per_share = abs(price - sl)
+        rps = abs(price - sl)
         if sig["side"] == "BUY":
-            target_1r = price + TARGET_1_R_MULTIPLE * risk_per_share
-            target_2r = price + TARGET_2_R_MULTIPLE * risk_per_share
+            t1 = price + TARGET_1_R_MULTIPLE * rps
+            t2 = price + TARGET_2_R_MULTIPLE * rps
         else:
-            target_1r = price - TARGET_1_R_MULTIPLE * risk_per_share
-            target_2r = price - TARGET_2_R_MULTIPLE * risk_per_share
+            t1 = price - TARGET_1_R_MULTIPLE * rps
+            t2 = price - TARGET_2_R_MULTIPLE * rps
 
-        est_charges = calc_charges(price, target_2r, qty)
-        est_net = risk_per_share * TARGET_2_R_MULTIPLE * qty - est_charges
+        est_c = calc_charges(price, t2, qty)
+        est_net = rps * TARGET_2_R_MULTIPLE * qty - est_c
         if est_net < min_required_net_profit(): continue
 
         candidates.append({
             "symbol": sym, "price": price, "sl": sl, "qty": qty,
             "cost": cost, "score": sig["score"], "strategies": sig["strategies"],
-            "side": sig["side"], "target_1r": target_1r, "target_2r": target_2r,
-            "est_charges": est_charges, "est_net": est_net
+            "side": sig["side"], "target_1r": t1, "target_2r": t2,
+            "est_charges": est_c, "est_net": est_net
         })
+        seen_syms.add(sym)
 
     if not candidates: return
     candidates.sort(key=lambda x: x["score"], reverse=True)
-    best = candidates[0]
 
-    new_pos = {
-        "symbol": best["symbol"],
-        "entry": best["price"],
-        "qty": best["qty"],
-        "sl": best["sl"],
-        "initial_sl": best["sl"],
-        "trail_high": best["price"],
-        "target_1r": best["target_1r"],
-        "target_2r": best["target_2r"],
-        "side": best["side"],
-        "strategies": best["strategies"],
-        "entry_time": str(now),
-        "entry_date": today,
-        "days_held": 0,
-        "partial_booked": False,
-    }
-    state["open_positions"].append(new_pos)
-    state["capital"] -= best["cost"]   # FIX: deduct on entry
-    save_state(state)
+    # FIX: Take top candidates up to available slots
+    entries_taken = 0
+    for best in candidates:
+        if entries_taken >= slots: break
+        if state["trades_today"] + entries_taken >= MAX_TRADES_PER_DAY: break
 
-    sl_pct = abs(best["price"] - best["sl"]) / best["price"] * 100
-    send_telegram(
-        f"📈 *PAPER {best['side']} (DELIVERY)*\n"
-        f"Stock: {best['symbol']}\n"
-        f"Price: ₹{best['price']:.2f}\n"
-        f"Qty: {best['qty']}\n"
-        f"Cost: ₹{best['cost']:.2f}\n"
-        f"Stop Loss: ₹{best['sl']:.2f} ({sl_pct:.2f}%)\n"
-        f"Target 1.5R: ₹{best['target_1r']:.2f}\n"
-        f"Target 3R: ₹{best['target_2r']:.2f}\n"
-        f"Signal Score: {best['score']}\n"
-        f"Strategies: {', '.join(best['strategies'])}\n"
-        f"Est. Charges: ₹{best['est_charges']:.2f}\n"
-        f"Est. Net Profit: ₹{best['est_net']:.2f}\n"
-        f"Open Positions: {count_open_positions(state)}/{MAX_POSITIONS}\n"
-        f"Available Cash: ₹{state['capital']:.2f}\n"
-        f"Hold Period: Up to {HOLD_DAYS_MAX} days"
-    )
+        cost = best["cost"]
+        # FIX: recompute available
+        if cost > state["capital"]: continue
 
+        new_pos = {
+            "symbol": best["symbol"], "entry": best["price"], "qty": best["qty"],
+            "sl": best["sl"], "initial_sl": best["sl"], "trail_high": best["price"],
+            "target_1r": best["target_1r"], "target_2r": best["target_2r"],
+            "side": best["side"], "strategies": best["strategies"],
+            "entry_time": str(now), "entry_date": today,
+            "entry_dt": now.isoformat(), "days_held": 0, "partial_booked": False
+        }
+        state["open_positions"].append(new_pos)
+        state["capital"] -= cost  # FIX: deduct after each entry
+        entries_taken += 1
+
+        sl_pct = abs(best["price"] - best["sl"]) / best["price"] * 100
+        send_telegram(
+            f"📈 *PAPER {best['side']} — QUICK ENTRY*\n"
+            f"Stock: {best['symbol']}\n"
+            f"Price: ₹{best['price']:.2f}\n"
+            f"Qty: {best['qty']}\n"
+            f"Cost: ₹{best['cost']:.2f}\n"
+            f"Stop Loss: ₹{best['sl']:.2f} ({sl_pct:.2f}%)\n"
+            f"Target 1R (60% book): ₹{best['target_1r']:.2f}\n"
+            f"Target 2R (final): ₹{best['target_2r']:.2f}\n"
+            f"Signal Score: {best['score']}\n"
+            f"Strategies: {', '.join(best['strategies'])}\n"
+            f"Est. Charges: ₹{best['est_charges']:.2f}\n"
+            f"Est. Net: ₹{best['est_net']:.2f}\n"
+            f"Positions: {count_open_positions(state)}/{MAX_POSITIONS}\n"
+            f"Available Cash: ₹{state['capital']:.2f}"
+        )
+
+    if entries_taken > 0:
+        save_state(state)
+
+# ============================================================
+# ==================== MANAGE POSITION (FIXED) ==============
+# ============================================================
 def manage_open_position(state, stats, pos):
     sym = pos["symbol"]
     df = fetch_intraday(sym)
@@ -831,20 +773,32 @@ def manage_open_position(state, stats, pos):
     today = datetime.now(IST).date()
     pos["days_held"] = (today - entry_date).days
 
-    risk_per_share = abs(pos["entry"] - pos["initial_sl"])
-    if risk_per_share <= 0: return
+    # Hours held (FIX: safe parse with entry_time fallback)
+    entry_dt = safe_parse_dt(pos.get("entry_dt"))
+    if entry_dt is None:
+        entry_dt = safe_parse_dt(pos.get("entry_time"))
+    if entry_dt is None:
+        hours_held = 0
+    else:
+        if entry_dt.tzinfo is None:
+            entry_dt = IST.localize(entry_dt)
+        hours_held = (datetime.now(IST) - entry_dt).total_seconds() / 3600
 
-    # Trail high
+    rps = abs(pos["entry"] - pos["initial_sl"])
+    if rps <= 0: return
+
     if side == "BUY":
         if price > pos["trail_high"]: pos["trail_high"] = price
     else:
         if price < pos["trail_high"]: pos["trail_high"] = price
 
-    # Partial booking
-    if not pos.get("partial_booked"):
+    # Partial book — FIX: skip if qty < 2
+    if not pos.get("partial_booked") and pos["qty"] >= 2:
         hit_1r = (side == "BUY" and price >= pos["target_1r"]) or (side == "SELL" and price <= pos["target_1r"])
         if hit_1r:
             book_qty = int(pos["qty"] * PARTIAL_BOOK_PCT)
+            if book_qty < 1: book_qty = 1
+            if book_qty >= pos["qty"]: book_qty = pos["qty"] - 1
             if book_qty >= 1:
                 if side == "BUY":
                     gross = (price - pos["entry"]) * book_qty
@@ -852,29 +806,27 @@ def manage_open_position(state, stats, pos):
                     gross = (pos["entry"] - price) * book_qty
                 charges = calc_charges(pos["entry"], price, book_qty)
                 net = gross - charges
-                # Proceeds credited: entry_cost_returned + net
                 proceeds = pos["entry"] * book_qty + net
                 state["capital"] += proceeds
                 pos["qty"] -= book_qty
                 pos["partial_booked"] = True
                 pos["sl"] = pos["entry"]
-
                 log_trade({
                     "date": str(today), "time": str(datetime.now(IST).time()),
-                    "symbol": sym, "strategy": "PARTIAL_1.5R", "side": side,
+                    "symbol": sym, "strategy": "PARTIAL_1R", "side": side,
                     "entry": pos["entry"], "qty": book_qty, "exit": price,
                     "gross": round(gross, 2), "charges": charges,
-                    "net": round(net, 2), "reason": "Partial 1.5R",
+                    "net": round(net, 2), "reason": "Partial 1R quick book",
                     "capital_after": round(state["capital"], 2), "mode": CAPITAL_MODE
                 })
                 save_state(state)
                 send_telegram(
-                    f"💰 *PARTIAL BOOK (50% at 1.5R)*\n"
+                    f"💰 *QUICK BOOK 60% at 1R*\n"
                     f"Stock: {sym}\n"
                     f"Booked: {book_qty} shares\n"
                     f"Price: ₹{price:.2f}\n"
                     f"Net Profit: ₹{net:.2f}\n"
-                    f"SL moved to Breakeven: ₹{pos['entry']:.2f}\n"
+                    f"SL → Breakeven: ₹{pos['entry']:.2f}\n"
                     f"Remaining: {pos['qty']} shares"
                 )
 
@@ -888,21 +840,43 @@ def manage_open_position(state, stats, pos):
             if new_sl < pos["sl"]: pos["sl"] = new_sl; save_state(state)
     else:
         if side == "BUY":
-            new_sl = max(pos["sl"], price * 0.985)
+            new_sl = max(pos["sl"], price * (1 - TRAIL_PCT_BEFORE_1R))
             if new_sl > pos["sl"]: pos["sl"] = new_sl; save_state(state)
         else:
-            new_sl = min(pos["sl"], price * 1.015)
+            new_sl = min(pos["sl"], price * (1 + TRAIL_PCT_BEFORE_1R))
             if new_sl < pos["sl"]: pos["sl"] = new_sl; save_state(state)
+
+    # Momentum boost trail lock (FIX: save_state added)
+    if side == "BUY":
+        move_r = (price - pos["entry"]) / rps
+    else:
+        move_r = (pos["entry"] - price) / rps
+    if move_r >= MOMENTUM_BOOST_R:
+        if side == "BUY":
+            lock_sl = price * (1 - 0.005)
+            if lock_sl > pos["sl"]:
+                pos["sl"] = lock_sl
+                save_state(state)  # FIX
+        else:
+            lock_sl = price * (1 + 0.005)
+            if lock_sl < pos["sl"]:
+                pos["sl"] = lock_sl
+                save_state(state)  # FIX
 
     # Exit checks
     exit_price, reason = None, None
     if side == "BUY":
-        if price <= pos["sl"]: exit_price, reason = price, "Trailing SL hit"
-        elif price >= pos["target_2r"]: exit_price, reason = price, "3R Target hit"
+        if price <= pos["sl"]: exit_price, reason = price, "SL hit"
+        elif price >= pos["target_2r"]: exit_price, reason = price, "2R target"
     else:
-        if price >= pos["sl"]: exit_price, reason = price, "Trailing SL hit"
-        elif price <= pos["target_2r"]: exit_price, reason = price, "3R Target hit"
+        if price >= pos["sl"]: exit_price, reason = price, "SL hit"
+        elif price <= pos["target_2r"]: exit_price, reason = price, "2R target"
 
+    # No-move exit
+    if not exit_price and hours_held >= NO_MOVE_EXIT_HOURS and move_r < 0.5:
+        exit_price, reason = price, f"No-move exit ({int(hours_held)}h)"
+
+    # Max days exit
     if not exit_price and pos["days_held"] >= HOLD_DAYS_MAX:
         if (side == "BUY" and price > pos["entry"]) or (side == "SELL" and price < pos["entry"]):
             exit_price, reason = price, f"Time exit ({HOLD_DAYS_MAX}d, profit)"
@@ -911,7 +885,7 @@ def manage_open_position(state, stats, pos):
 
     if not exit_price: return
 
-    # Close remaining
+    # Close
     if side == "BUY":
         gross = (exit_price - pos["entry"]) * pos["qty"]
     else:
@@ -927,11 +901,9 @@ def manage_open_position(state, stats, pos):
     for sname in pos["strategies"]:
         if sname in stats:
             if net > 0:
-                stats[sname]["wins"] += 1
-                stats[sname]["streak_losses"] = 0
+                stats[sname]["wins"] += 1; stats[sname]["streak_losses"] = 0
             else:
-                stats[sname]["losses"] += 1
-                stats[sname]["streak_losses"] += 1
+                stats[sname]["losses"] += 1; stats[sname]["streak_losses"] += 1
             stats[sname]["pnl"] = round(stats[sname]["pnl"] + net, 2)
             stats[sname]["total"] = stats[sname]["wins"] + stats[sname]["losses"]
     save_strategy_stats(stats)
@@ -947,18 +919,17 @@ def manage_open_position(state, stats, pos):
 
     emoji = "✅" if net > 0 else "❌"
     send_telegram(
-        f"{emoji} *PAPER {side} EXIT (DELIVERY)*\n"
+        f"{emoji} *PAPER {side} EXIT*\n"
         f"Stock: {sym}\n"
-        f"Strategies: {', '.join(pos['strategies'])}\n"
         f"Entry: ₹{pos['entry']:.2f}\n"
         f"Exit: ₹{exit_price:.2f}\n"
         f"Qty: {pos['qty']}\n"
-        f"Days Held: {pos['days_held']}\n"
+        f"Held: {pos['days_held']}d / {int(hours_held)}h\n"
         f"Reason: {reason}\n"
-        f"Gross P&L: ₹{gross:.2f}\n"
+        f"Gross: ₹{gross:.2f}\n"
         f"Charges: ₹{charges:.2f}\n"
-        f"Net P&L: ₹{net:.2f}\n"
-        f"Available Cash: ₹{state['capital']:.2f}"
+        f"Net: ₹{net:.2f}\n"
+        f"Available: ₹{state['capital']:.2f}"
     )
 
     state["open_positions"].remove(pos)
@@ -969,22 +940,18 @@ def manage_open_position(state, stats, pos):
 # ============================================================
 def generate_summary(period):
     if not os.path.exists(LOG_FILE): return None
-    try:
-        df = pd.read_csv(LOG_FILE)
+    try: df = pd.read_csv(LOG_FILE)
     except: return None
     if len(df) == 0: return None
     df["date"] = pd.to_datetime(df["date"])
     today = datetime.now(IST).date()
 
     if period == "daily":
-        mask = df["date"].dt.date == today
-        title = "📊 Daily Summary"
+        mask = df["date"].dt.date == today; title = "📊 Daily Summary"
     elif period == "weekly":
-        mask = df["date"].dt.date >= (today - timedelta(days=7))
-        title = "📊 Weekly Summary"
+        mask = df["date"].dt.date >= (today - timedelta(days=7)); title = "📊 Weekly Summary"
     else:
-        mask = df["date"].dt.date >= (today - timedelta(days=30))
-        title = "📊 Monthly Summary"
+        mask = df["date"].dt.date >= (today - timedelta(days=30)); title = "📊 Monthly Summary"
 
     sub = df[mask]
     if len(sub) == 0: return None
@@ -999,12 +966,11 @@ def generate_summary(period):
     msg += f"Trades: {total} | Wins: {wins} | Losses: {losses}\n"
     msg += f"Win Rate: {winrate:.1f}%\n"
     msg += f"Avg Win: ₹{avg_win:.2f} | Avg Loss: ₹{avg_loss:.2f}\n"
-    msg += f"Gross P&L: ₹{gross:.2f}\n"
-    msg += f"Total Charges: ₹{charges:.2f}\n"
+    msg += f"Gross: ₹{gross:.2f} | Charges: ₹{charges:.2f}\n"
     msg += f"*Net P&L: ₹{net:.2f}*\n\n"
 
     msg += "*Strategy Performance:*\n"
-    strat_df = sub[sub["strategy"] != "PARTIAL_1.5R"]
+    strat_df = sub[sub["strategy"] != "PARTIAL_1R"]
     for s in STRATEGY_NAMES:
         ssub = strat_df[strat_df["strategy"].str.contains(s, na=False)]
         if len(ssub) == 0: continue
@@ -1021,7 +987,7 @@ def check_summaries(state):
     if now.time() >= dtime(15, 35) and state.get("last_daily") != today:
         r = generate_summary("daily")
         if r:
-            send_telegram(r[0]); send_document(r[1], "Daily trade log")
+            send_telegram(r[0]); send_document(r[1], "Daily log")
         state["last_daily"] = today; updated = True
 
     if now.weekday() == 5 and now.time() >= dtime(10, 0):
@@ -1029,7 +995,7 @@ def check_summaries(state):
         if state.get("last_weekly") != wk:
             r = generate_summary("weekly")
             if r:
-                send_telegram(r[0]); send_document(r[1], "Weekly trade log")
+                send_telegram(r[0]); send_document(r[1], "Weekly log")
             state["last_weekly"] = wk; updated = True
 
     if now.day == 1 and now.time() >= dtime(10, 0):
@@ -1037,7 +1003,7 @@ def check_summaries(state):
         if state.get("last_monthly") != mk:
             r = generate_summary("monthly")
             if r:
-                send_telegram(r[0]); send_document(r[1], "Monthly trade log")
+                send_telegram(r[0]); send_document(r[1], "Monthly log")
             state["last_monthly"] = mk; updated = True
 
     if updated: save_state(state)
@@ -1047,45 +1013,58 @@ def check_summaries(state):
 # ============================================================
 if __name__ == "__main__":
     send_telegram(
-        f"🤖 *Paper Trading Bot v7.1 ONLINE*\n\n"
-        f"Mode: *DELIVERY (CNC)*\n"
+        f"🤖 *Paper Trading Bot v7.3 ONLINE*\n\n"
+        f"Mode: *DELIVERY QUICK PROFIT*\n"
         f"Capital: ₹{CAPITAL_START}\n"
         f"Risk/Trade: {RISK_PER_TRADE_PCT*100}%\n"
         f"Max Positions: {MAX_POSITIONS}\n"
+        f"Max Hold: {HOLD_DAYS_MAX} days\n"
+        f"Partial: 60% at 1R | Final: 2R\n"
+        f"Tight Trail: 0.8%\n"
+        f"No-Move Exit: {NO_MOVE_EXIT_HOURS}h\n"
         f"Strategies: {len(STRATEGY_NAMES)}\n"
-        f"Universe: {len(WATCHLIST)} stocks\n"
-        f"Min Signal: {MIN_SIGNAL_SCORE}\n"
-        f"Daily Loss Limit: {DAILY_LOSS_LIMIT_PCT*100}%\n"
-        f"Max DD: {MAX_DRAWDOWN_PCT*100}%\n"
-        f"Targets: 1.5R partial + 3R final\n"
-        f"Scan Window: 2:45-3:15 PM IST"
+        f"Universe: {len(WATCHLIST)} stocks"
     )
 
     while True:
         try:
             now = datetime.now(IST)
             state = load_state()
+            stats = load_strategy_stats()
 
-            # Manage positions all day (single place)
+            # FIX: Daily reset first (before any manage/scan)
+            daily_reset_if_needed(state)
+
+            # Update peak capital
+            if state["capital"] > state["peak_capital"]:
+                state["peak_capital"] = state["capital"]
+                save_state(state)
+
+            # Drawdown check
+            dd = (state["peak_capital"] - state["capital"]) / max(1, state["peak_capital"])
+            if dd >= MAX_DRAWDOWN_PCT:
+                today = str(now.date())
+                if state.get("drawdown_alerted") != today:
+                    send_telegram(f"🛑 *HALTED*\nDrawdown: {dd*100:.1f}%")
+                    state["drawdown_alerted"] = today
+                    save_state(state)
+
+            # FIX: Manage positions ONCE (only in main loop)
             if dtime(9, 15) <= now.time() <= dtime(15, 30) and now.weekday() < 5:
-                stats = load_strategy_stats()
-                for pos in list(state.get("open_positions", [])):
-                    try:
-                        manage_open_position(state, stats, pos)
-                    except Exception as e:
-                        print(f"[manage {pos.get('symbol')}] {e}")
+                if dd < MAX_DRAWDOWN_PCT:
+                    for pos in list(state.get("open_positions", [])):
+                        try: manage_open_position(state, stats, pos)
+                        except Exception as e: print(f"[manage {pos.get('symbol')}] {e}")
 
-            # New entries only during scan window
-            if dtime(14, 45) <= now.time() <= dtime(15, 15) and now.weekday() < 5:
-                try:
-                    run_scan()
-                except Exception as e:
-                    print(f"[run_scan] {e}")
+            # FIX: Scan only — no manage inside
+            if dtime(9, 30) <= now.time() <= dtime(15, 0) and now.weekday() < 5:
+                if dd < MAX_DRAWDOWN_PCT:
+                    try: run_scan(state, stats)
+                    except Exception as e: print(f"[scan] {e}")
 
             check_summaries(state)
             time.sleep(900)
-        except KeyboardInterrupt:
-            break
+        except KeyboardInterrupt: break
         except Exception as e:
             send_telegram(f"⚠️ *Error*\n{str(e)[:200]}")
             time.sleep(60)
