@@ -1,6 +1,10 @@
 """
-AI Paper Trading Bot v7.3 — QUICK PROFIT DELIVERY MODE
-Bug Fixes: double manage, daily reset, momentum save, multi-entry, entry_dt fallback
+AI Paper Trading Bot v7.4 — DELIVERY QUICK PROFIT MODE
+- Token from environment variables (no leaks)
+- Capital: ₹5,000 (available cash model)
+- 20 Strategies with scoring system
+- NSE + BSE universe
+- Multi-day position holding with quick profit booking
 """
 
 import yfinance as yf
@@ -14,8 +18,9 @@ warnings.filterwarnings('ignore')
 # ============================================================
 # ==================== CONFIGURATION =========================
 # ============================================================
-TOKEN = "8919842664:AAEcxSad6guNmcqPwlBFn_BBtwAAvrB8Ac8"
-CHAT_ID = "5606330617"
+# SECURITY: Token from Railway environment variables
+TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 CAPITAL_START = 5000.0
 CAPITAL_MODE = "DELIVERY"
@@ -117,6 +122,9 @@ LOG_FILE = "trades.csv"
 STRATEGY_STATS_FILE = "strategy_stats.json"
 
 def send_telegram(msg):
+    if not TOKEN or not CHAT_ID:
+        print("[Telegram] Token or Chat ID missing!")
+        return
     try:
         r = requests.get(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
                          params={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"},
@@ -127,6 +135,7 @@ def send_telegram(msg):
         print(f"[TG Exception] {e}")
 
 def send_document(filepath, caption=""):
+    if not TOKEN or not CHAT_ID: return
     try:
         if not os.path.exists(filepath): return
         with open(filepath, "rb") as f:
@@ -192,7 +201,6 @@ def save_state(s):
         print(f"[State Save Error] {e}")
 
 def daily_reset_if_needed(state):
-    """FIX: Separate function - called first in main loop"""
     today = str(datetime.now(IST).date())
     if state["date"] != today:
         state["date"] = today
@@ -238,18 +246,13 @@ def log_trade(row):
         print(f"[Log Error] {e}")
 
 def safe_parse_dt(s):
-    """FIX: Safe datetime parsing with fallback"""
     if not s: return None
-    try:
-        return datetime.fromisoformat(s)
+    try: return datetime.fromisoformat(s)
     except:
-        try:
-            return datetime.strptime(s, "%Y-%m-%d %H:%M:%S.%f%z")
+        try: return datetime.strptime(s, "%Y-%m-%d %H:%M:%S.%f%z")
         except:
-            try:
-                return datetime.strptime(s, "%Y-%m-%d %H:%M:%S.%f")
-            except:
-                return None
+            try: return datetime.strptime(s, "%Y-%m-%d %H:%M:%S.%f")
+            except: return None
 
 # ============================================================
 # ==================== DATA ==================================
@@ -646,17 +649,15 @@ def calc_position_size(available_capital, price, sl, atr):
 def count_open_positions(state): return len(state.get("open_positions", []))
 
 # ============================================================
-# ==================== SCAN (FIXED - no manage, multi-entry)
+# ==================== SCAN ==================================
 # ============================================================
 def run_scan(state, stats):
-    """FIX: Takes state and stats as params, no manage call, multi-entry"""
     now = datetime.now(IST)
     today = str(now.date())
 
     if state["loss_today"] >= DAILY_LOSS_LIMIT_PCT * state["starting_capital"]: return
     if state["trades_today"] >= MAX_TRADES_PER_DAY: return
 
-    # FIX: Fill up to MAX_POSITIONS slots
     slots = MAX_POSITIONS - count_open_positions(state)
     if slots <= 0: return
 
@@ -709,15 +710,11 @@ def run_scan(state, stats):
     if not candidates: return
     candidates.sort(key=lambda x: x["score"], reverse=True)
 
-    # FIX: Take top candidates up to available slots
     entries_taken = 0
     for best in candidates:
         if entries_taken >= slots: break
         if state["trades_today"] + entries_taken >= MAX_TRADES_PER_DAY: break
-
-        cost = best["cost"]
-        # FIX: recompute available
-        if cost > state["capital"]: continue
+        if best["cost"] > state["capital"]: continue
 
         new_pos = {
             "symbol": best["symbol"], "entry": best["price"], "qty": best["qty"],
@@ -728,7 +725,7 @@ def run_scan(state, stats):
             "entry_dt": now.isoformat(), "days_held": 0, "partial_booked": False
         }
         state["open_positions"].append(new_pos)
-        state["capital"] -= cost  # FIX: deduct after each entry
+        state["capital"] -= best["cost"]
         entries_taken += 1
 
         sl_pct = abs(best["price"] - best["sl"]) / best["price"] * 100
@@ -753,7 +750,7 @@ def run_scan(state, stats):
         save_state(state)
 
 # ============================================================
-# ==================== MANAGE POSITION (FIXED) ==============
+# ==================== MANAGE POSITION =======================
 # ============================================================
 def manage_open_position(state, stats, pos):
     sym = pos["symbol"]
@@ -765,7 +762,6 @@ def manage_open_position(state, stats, pos):
 
     side = pos["side"]
 
-    # Days held
     try:
         entry_date = datetime.strptime(pos.get("entry_date", str(datetime.now(IST).date())), "%Y-%m-%d").date()
     except:
@@ -773,7 +769,6 @@ def manage_open_position(state, stats, pos):
     today = datetime.now(IST).date()
     pos["days_held"] = (today - entry_date).days
 
-    # Hours held (FIX: safe parse with entry_time fallback)
     entry_dt = safe_parse_dt(pos.get("entry_dt"))
     if entry_dt is None:
         entry_dt = safe_parse_dt(pos.get("entry_time"))
@@ -792,7 +787,6 @@ def manage_open_position(state, stats, pos):
     else:
         if price < pos["trail_high"]: pos["trail_high"] = price
 
-    # Partial book — FIX: skip if qty < 2
     if not pos.get("partial_booked") and pos["qty"] >= 2:
         hit_1r = (side == "BUY" and price >= pos["target_1r"]) or (side == "SELL" and price <= pos["target_1r"])
         if hit_1r:
@@ -830,7 +824,6 @@ def manage_open_position(state, stats, pos):
                     f"Remaining: {pos['qty']} shares"
                 )
 
-    # Trailing SL
     if pos.get("partial_booked"):
         if side == "BUY":
             new_sl = max(pos["sl"], price * (1 - TRAIL_PCT_AFTER_1R))
@@ -846,7 +839,6 @@ def manage_open_position(state, stats, pos):
             new_sl = min(pos["sl"], price * (1 + TRAIL_PCT_BEFORE_1R))
             if new_sl < pos["sl"]: pos["sl"] = new_sl; save_state(state)
 
-    # Momentum boost trail lock (FIX: save_state added)
     if side == "BUY":
         move_r = (price - pos["entry"]) / rps
     else:
@@ -856,14 +848,13 @@ def manage_open_position(state, stats, pos):
             lock_sl = price * (1 - 0.005)
             if lock_sl > pos["sl"]:
                 pos["sl"] = lock_sl
-                save_state(state)  # FIX
+                save_state(state)
         else:
             lock_sl = price * (1 + 0.005)
             if lock_sl < pos["sl"]:
                 pos["sl"] = lock_sl
-                save_state(state)  # FIX
+                save_state(state)
 
-    # Exit checks
     exit_price, reason = None, None
     if side == "BUY":
         if price <= pos["sl"]: exit_price, reason = price, "SL hit"
@@ -872,11 +863,9 @@ def manage_open_position(state, stats, pos):
         if price >= pos["sl"]: exit_price, reason = price, "SL hit"
         elif price <= pos["target_2r"]: exit_price, reason = price, "2R target"
 
-    # No-move exit
     if not exit_price and hours_held >= NO_MOVE_EXIT_HOURS and move_r < 0.5:
         exit_price, reason = price, f"No-move exit ({int(hours_held)}h)"
 
-    # Max days exit
     if not exit_price and pos["days_held"] >= HOLD_DAYS_MAX:
         if (side == "BUY" and price > pos["entry"]) or (side == "SELL" and price < pos["entry"]):
             exit_price, reason = price, f"Time exit ({HOLD_DAYS_MAX}d, profit)"
@@ -885,7 +874,6 @@ def manage_open_position(state, stats, pos):
 
     if not exit_price: return
 
-    # Close
     if side == "BUY":
         gross = (exit_price - pos["entry"]) * pos["qty"]
     else:
@@ -1009,22 +997,27 @@ def check_summaries(state):
     if updated: save_state(state)
 
 # ============================================================
-# ==================== MAIN LOOP (FIXED) =====================
+# ==================== MAIN LOOP =============================
 # ============================================================
 if __name__ == "__main__":
-    send_telegram(
-        f"🤖 *Paper Trading Bot v7.3 ONLINE*\n\n"
-        f"Mode: *DELIVERY QUICK PROFIT*\n"
-        f"Capital: ₹{CAPITAL_START}\n"
-        f"Risk/Trade: {RISK_PER_TRADE_PCT*100}%\n"
-        f"Max Positions: {MAX_POSITIONS}\n"
-        f"Max Hold: {HOLD_DAYS_MAX} days\n"
-        f"Partial: 60% at 1R | Final: 2R\n"
-        f"Tight Trail: 0.8%\n"
-        f"No-Move Exit: {NO_MOVE_EXIT_HOURS}h\n"
-        f"Strategies: {len(STRATEGY_NAMES)}\n"
-        f"Universe: {len(WATCHLIST)} stocks"
-    )
+    if not TOKEN or not CHAT_ID:
+        print("⚠️ TELEGRAM_TOKEN or TELEGRAM_CHAT_ID not set!")
+        print("Set them in Railway Variables tab.")
+    else:
+        send_telegram(
+            f"🤖 *Paper Trading Bot v7.4 ONLINE*\n\n"
+            f"Mode: *DELIVERY QUICK PROFIT*\n"
+            f"Capital: ₹{CAPITAL_START}\n"
+            f"Risk/Trade: {RISK_PER_TRADE_PCT*100}%\n"
+            f"Max Positions: {MAX_POSITIONS}\n"
+            f"Max Hold: {HOLD_DAYS_MAX} days\n"
+            f"Partial: 60% at 1R | Final: 2R\n"
+            f"Tight Trail: 0.8%\n"
+            f"No-Move Exit: {NO_MOVE_EXIT_HOURS}h\n"
+            f"Strategies: {len(STRATEGY_NAMES)}\n"
+            f"Universe: {len(WATCHLIST)} stocks\n"
+            f"Security: ✅ Token from env vars"
+        )
 
     while True:
         try:
@@ -1032,15 +1025,12 @@ if __name__ == "__main__":
             state = load_state()
             stats = load_strategy_stats()
 
-            # FIX: Daily reset first (before any manage/scan)
             daily_reset_if_needed(state)
 
-            # Update peak capital
             if state["capital"] > state["peak_capital"]:
                 state["peak_capital"] = state["capital"]
                 save_state(state)
 
-            # Drawdown check
             dd = (state["peak_capital"] - state["capital"]) / max(1, state["peak_capital"])
             if dd >= MAX_DRAWDOWN_PCT:
                 today = str(now.date())
@@ -1049,14 +1039,12 @@ if __name__ == "__main__":
                     state["drawdown_alerted"] = today
                     save_state(state)
 
-            # FIX: Manage positions ONCE (only in main loop)
             if dtime(9, 15) <= now.time() <= dtime(15, 30) and now.weekday() < 5:
                 if dd < MAX_DRAWDOWN_PCT:
                     for pos in list(state.get("open_positions", [])):
                         try: manage_open_position(state, stats, pos)
                         except Exception as e: print(f"[manage {pos.get('symbol')}] {e}")
 
-            # FIX: Scan only — no manage inside
             if dtime(9, 30) <= now.time() <= dtime(15, 0) and now.weekday() < 5:
                 if dd < MAX_DRAWDOWN_PCT:
                     try: run_scan(state, stats)
